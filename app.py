@@ -10,7 +10,8 @@ import httpx
 import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
 
@@ -374,10 +375,39 @@ async def forward_request(
     req: Request,
     full_path: str,
     sanitized_payload: Any,
+    stream: bool = False,
 ) -> Response:
     url = f"{settings.upstream_base_url}/{full_path}"
 
     timeout = httpx.Timeout(600.0, connect=30.0)
+
+    if stream:
+        client = httpx.AsyncClient(timeout=timeout)
+        upstream_req = client.build_request(
+            method=req.method,
+            url=url,
+            headers=build_upstream_headers(req),
+            params=dict(req.query_params),
+            json=sanitized_payload,
+        )
+        upstream_stream = await client.send(upstream_req, stream=True)
+        async def close_upstream() -> None:
+            await upstream_stream.aclose()
+            await client.aclose()
+
+        content_type = upstream_stream.headers.get("content-type", "application/json")
+        headers = {
+            k: v
+            for k, v in upstream_stream.headers.items()
+            if k.lower() not in {"content-length", "connection"}
+        }
+        return StreamingResponse(
+            upstream_stream.aiter_bytes(),
+            status_code=upstream_stream.status_code,
+            headers=headers,
+            media_type=content_type,
+            background=BackgroundTask(close_upstream),
+        )
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         upstream = await client.request(
@@ -388,27 +418,27 @@ async def forward_request(
             json=sanitized_payload,
         )
 
-    content_type = upstream.headers.get("content-type", "application/json")
+        content_type = upstream.headers.get("content-type", "application/json")
 
-    excluded_resp_headers = {
-        "content-length",
-        "content-encoding",
-        "transfer-encoding",
-        "connection",
-    }
+        excluded_resp_headers = {
+            "content-length",
+            "content-encoding",
+            "transfer-encoding",
+            "connection",
+        }
 
-    headers = {
-        k: v
-        for k, v in upstream.headers.items()
-        if k.lower() not in excluded_resp_headers
-    }
+        headers = {
+            k: v
+            for k, v in upstream.headers.items()
+            if k.lower() not in excluded_resp_headers
+        }
 
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=headers,
-        media_type=content_type,
-    )
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=headers,
+            media_type=content_type,
+        )
 
 
 @app.api_route("/v1/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -432,7 +462,11 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
     sanitized_payload, in_stats = await sanitizer.sanitize_payload(payload)
     await metrics.add(in_stats.tokens, in_stats.spans, in_stats.labels)
 
-    upstream_resp = await forward_request(req, full_path, sanitized_payload)
+    wants_stream = bool(isinstance(payload, dict) and payload.get("stream") is True)
+    if wants_stream:
+        return await forward_request(req, full_path, sanitized_payload, stream=True)
+
+    upstream_resp = await forward_request(req, full_path, sanitized_payload, stream=False)
 
     # Ajout headers utiles.
     upstream_resp.headers["x-privacy-filtered-tokens"] = str(in_stats.tokens)
