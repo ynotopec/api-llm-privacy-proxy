@@ -35,6 +35,7 @@ async def test_proxy_filters_openai_payload(monkeypatch):
 
     async def fake_forward_request(req, full_path, sanitized_payload):
         assert full_path == "chat/completions"
+        assert sanitized_payload["stream"] is True
         assert sanitized_payload["messages"][0]["content"] == (
             "Hello, my name is [PRIVATE_PERSON_1] and my email is [PRIVATE_EMAIL_1]"
         )
@@ -69,7 +70,8 @@ async def test_proxy_filters_openai_payload(monkeypatch):
                         "role": "user",
                         "content": "Hello, my name is Alice Smith and my email is alice@example.com"
                     }
-                ]
+                ],
+                "stream": True,
             },
         )
 
