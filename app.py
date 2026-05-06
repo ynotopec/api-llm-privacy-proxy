@@ -68,14 +68,15 @@ settings = Settings()
 
 
 def suffix_model_id(model_id: str) -> str:
-    if not settings.model_suffix or model_id.endswith(settings.model_suffix):
+    if not model_id or not settings.model_suffix or model_id.endswith(settings.model_suffix):
         return model_id
     return f"{model_id}{settings.model_suffix}"
 
 
 def unsuffix_model_id(model_id: str) -> str:
-    if settings.model_suffix and model_id.endswith(settings.model_suffix):
-        return model_id[: -len(settings.model_suffix)]
+    suffix = settings.model_suffix
+    if suffix and model_id.endswith(suffix) and len(model_id) > len(suffix):
+        return model_id[: -len(suffix)]
     return model_id
 
 
@@ -93,6 +94,9 @@ def rewrite_request_model_ids(value: Any) -> Any:
     out = dict(value)
     model_id = out.get("model")
     if isinstance(model_id, str):
+        model_id = model_id.strip()
+        if not model_id or model_id == settings.model_suffix:
+            raise HTTPException(status_code=400, detail="invalid_model_id")
         out["model"] = unsuffix_model_id(model_id)
     return out
 

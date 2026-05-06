@@ -175,3 +175,67 @@ async def test_sanitizer_preserves_user_config_keys(monkeypatch):
     assert sanitized["reasoning_effort"] == "high"
     assert sanitized["messages"][0]["content"] == "Bonjour [PRIVATE_PERSON_1]"
     assert stats.spans == 1
+
+
+def test_model_suffix_helpers_do_not_create_empty_model_ids():
+    assert privacy_app.suffix_model_id("") == ""
+    assert privacy_app.unsuffix_model_id("-anonym") == "-anonym"
+    assert privacy_app.unsuffix_model_id("gpt-4o-anonym") == "gpt-4o"
+
+
+@pytest.mark.asyncio
+async def test_proxy_does_not_suffix_empty_model_list_ids(monkeypatch):
+    privacy_app.settings.inbound_api_keys = ["test-token"]
+
+    async def fake_forward_request(req, full_path, sanitized_payload, stream=False):
+        assert full_path == "models"
+        return JSONResponse(
+            {
+                "object": "list",
+                "data": [
+                    {"id": "", "object": "model"},
+                    {"id": "gpt-4o", "object": "model"},
+                ],
+            }
+        )
+
+    monkeypatch.setattr(privacy_app, "forward_request", fake_forward_request)
+
+    transport = ASGITransport(app=privacy_app.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+    assert res.status_code == 200
+    assert [model["id"] for model in res.json()["data"]] == ["", "gpt-4o-anonym"]
+
+
+@pytest.mark.asyncio
+async def test_proxy_rejects_empty_model_id(monkeypatch):
+    privacy_app.settings.inbound_api_keys = ["test-token"]
+    privacy_app.sanitizer = FakeSanitizer()
+
+    async def fake_forward_request(req, full_path, sanitized_payload, stream=False):
+        raise AssertionError("invalid model ids must not be forwarded upstream")
+
+    monkeypatch.setattr(privacy_app, "forward_request", fake_forward_request)
+
+    transport = ASGITransport(app=privacy_app.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        blank_res = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-token"},
+            json={"model": "", "messages": [{"role": "user", "content": "Bonjour"}]},
+        )
+        suffix_only_res = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-token"},
+            json={"model": "-anonym", "messages": [{"role": "user", "content": "Bonjour"}]},
+        )
+
+    assert blank_res.status_code == 400
+    assert blank_res.json()["detail"] == "invalid_model_id"
+    assert suffix_only_res.status_code == 400
+    assert suffix_only_res.json()["detail"] == "invalid_model_id"
