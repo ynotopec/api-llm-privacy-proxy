@@ -38,6 +38,8 @@ async def test_proxy_filters_openai_payload(monkeypatch):
         assert stream is False
         assert sanitized_payload["stream"] is False
         assert sanitized_payload["model"] == "gpt-4o"
+        assert sanitized_payload["thinking"] == {"level": "high", "budget_tokens": 1024}
+        assert sanitized_payload["metadata"]["model"] == "audit-model-anonym"
         assert sanitized_payload["messages"][0]["content"] == (
             "Hello, my name is [PRIVATE_PERSON_1] and my email is [PRIVATE_EMAIL_1]"
         )
@@ -68,6 +70,8 @@ async def test_proxy_filters_openai_payload(monkeypatch):
             headers={"Authorization": "Bearer test-token"},
             json={
                 "model": "gpt-4o-anonym",
+                "thinking": {"level": "high", "budget_tokens": 1024},
+                "metadata": {"model": "audit-model-anonym"},
                 "messages": [
                     {
                         "role": "user",
@@ -144,3 +148,30 @@ async def test_proxy_suffixes_model_list(monkeypatch):
         "gpt-4o-anonym",
         "embedding-model-anonym",
     ]
+
+
+@pytest.mark.asyncio
+async def test_sanitizer_preserves_user_config_keys(monkeypatch):
+    sanitizer = privacy_app.PrivacySanitizer()
+
+    async def fake_sanitize_text(text, ctx, stats):
+        if "Alice Smith" in text:
+            stats.add("private_person", 2)
+            return text.replace("Alice Smith", "[PRIVATE_PERSON_1]")
+        return text
+
+    monkeypatch.setattr(sanitizer, "sanitize_text", fake_sanitize_text)
+
+    sanitized, stats = await sanitizer.sanitize_payload(
+        {
+            "model": "gpt-4o-anonym",
+            "thinking": {"level": "high", "note": "Alice Smith"},
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "Bonjour Alice Smith"}],
+        }
+    )
+
+    assert sanitized["thinking"] == {"level": "high", "note": "Alice Smith"}
+    assert sanitized["reasoning_effort"] == "high"
+    assert sanitized["messages"][0]["content"] == "Bonjour [PRIVATE_PERSON_1]"
+    assert stats.spans == 1

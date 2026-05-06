@@ -55,7 +55,7 @@ class Settings:
             x.strip()
             for x in os.getenv(
                 "SKIP_JSON_KEYS",
-                "model,role,type,stream,temperature,max_tokens,top_p,tools,tool_choice,name",
+                "model,role,type,stream,temperature,max_tokens,top_p,tools,tool_choice,name,thinking,reasoning,reasoning_effort",
             ).split(",")
             if x.strip()
         }
@@ -87,35 +87,38 @@ def unsuffix_model_path(full_path: str) -> str:
 
 
 def rewrite_request_model_ids(value: Any) -> Any:
-    if isinstance(value, list):
-        return [rewrite_request_model_ids(item) for item in value]
+    if not isinstance(value, dict):
+        return value
 
-    if isinstance(value, dict):
-        out = {}
-        for key, item in value.items():
-            if key == "model" and isinstance(item, str):
-                out[key] = unsuffix_model_id(item)
-            else:
-                out[key] = rewrite_request_model_ids(item)
-        return out
-
-    return value
+    out = dict(value)
+    model_id = out.get("model")
+    if isinstance(model_id, str):
+        out["model"] = unsuffix_model_id(model_id)
+    return out
 
 
 def rewrite_response_model_ids(value: Any, *, models_endpoint: bool = False) -> Any:
     if isinstance(value, list):
         return [rewrite_response_model_ids(item, models_endpoint=models_endpoint) for item in value]
 
-    if isinstance(value, dict):
-        out = {}
-        for key, item in value.items():
-            if isinstance(item, str) and (key == "model" or (models_endpoint and key == "id")):
-                out[key] = suffix_model_id(item)
-            else:
-                out[key] = rewrite_response_model_ids(item, models_endpoint=models_endpoint)
-        return out
+    if not isinstance(value, dict):
+        return value
 
-    return value
+    out = dict(value)
+    model_id = out.get("model")
+    if isinstance(model_id, str):
+        out["model"] = suffix_model_id(model_id)
+
+    if models_endpoint:
+        object_id = out.get("id")
+        if isinstance(object_id, str) and out.get("object") == "model":
+            out["id"] = suffix_model_id(object_id)
+
+        data = out.get("data")
+        if isinstance(data, list):
+            out["data"] = [rewrite_response_model_ids(item, models_endpoint=True) for item in data]
+
+    return out
 
 
 class GlobalMetrics:
@@ -368,9 +371,10 @@ class PrivacySanitizer:
         stats: RedactionStats,
         parent_key: Optional[str],
     ) -> Any:
+        if parent_key in settings.skip_json_keys:
+            return value
+
         if isinstance(value, str):
-            if parent_key in settings.skip_json_keys:
-                return value
             return await self.sanitize_text(value, ctx, stats)
 
         if isinstance(value, list):
