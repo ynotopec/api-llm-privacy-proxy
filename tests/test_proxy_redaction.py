@@ -81,6 +81,7 @@ async def test_proxy_filters_openai_payload(monkeypatch):
     assert res.status_code == 200
     assert res.headers["x-privacy-filtered-tokens"] == "5"
     assert res.headers["x-privacy-filtered-spans"] == "2"
+    assert int(res.headers["content-length"]) == len(res.content)
     assert res.json()["model"] == "gpt-4o-anonym"
 
 
@@ -138,6 +139,7 @@ async def test_proxy_suffixes_model_list(monkeypatch):
         )
 
     assert res.status_code == 200
+    assert int(res.headers["content-length"]) == len(res.content)
     assert [model["id"] for model in res.json()["data"]] == [
         "gpt-4o-anonym",
         "embedding-model-anonym",

@@ -453,6 +453,20 @@ def build_upstream_headers(req: Request) -> Dict[str, str]:
     return headers
 
 
+def headers_for_modified_body(resp: Response) -> Dict[str, str]:
+    excluded = {
+        "content-length",
+        "content-encoding",
+        "transfer-encoding",
+        "connection",
+    }
+    return {
+        key: value
+        for key, value in resp.headers.items()
+        if key.lower() not in excluded
+    }
+
+
 def response_models_endpoint(full_path: str) -> bool:
     return full_path == "models" or full_path.startswith("models/")
 
@@ -474,8 +488,9 @@ def add_response_model_suffixes(upstream_resp: Response, full_path: str) -> Resp
     return JSONResponse(
         content=response_payload,
         status_code=upstream_resp.status_code,
-        headers=dict(upstream_resp.headers),
+        headers=headers_for_modified_body(upstream_resp),
     )
+
 
 async def forward_request(
     req: Request,
@@ -600,7 +615,7 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
     final = JSONResponse(
         content=response_payload,
         status_code=rewritten_resp.status_code,
-        headers=dict(rewritten_resp.headers),
+        headers=headers_for_modified_body(rewritten_resp),
     )
     if settings.filter_output:
         final.headers["x-privacy-filtered-output-tokens"] = str(out_stats.tokens)
