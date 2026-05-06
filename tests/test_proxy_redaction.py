@@ -37,6 +37,7 @@ async def test_proxy_filters_openai_payload(monkeypatch):
         assert full_path == "chat/completions"
         assert stream is False
         assert sanitized_payload["stream"] is False
+        assert sanitized_payload["model"] == "gpt-4o"
         assert sanitized_payload["messages"][0]["content"] == (
             "Hello, my name is [PRIVATE_PERSON_1] and my email is [PRIVATE_EMAIL_1]"
         )
@@ -44,6 +45,7 @@ async def test_proxy_filters_openai_payload(monkeypatch):
             {
                 "id": "chatcmpl-test",
                 "object": "chat.completion",
+                "model": "gpt-4o",
                 "choices": [
                     {
                         "index": 0,
@@ -65,7 +67,7 @@ async def test_proxy_filters_openai_payload(monkeypatch):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-token"},
             json={
-                "model": "ai-chat",
+                "model": "gpt-4o-anonym",
                 "messages": [
                     {
                         "role": "user",
@@ -79,6 +81,7 @@ async def test_proxy_filters_openai_payload(monkeypatch):
     assert res.status_code == 200
     assert res.headers["x-privacy-filtered-tokens"] == "5"
     assert res.headers["x-privacy-filtered-spans"] == "2"
+    assert res.json()["model"] == "gpt-4o-anonym"
 
 
 @pytest.mark.asyncio
@@ -89,6 +92,7 @@ async def test_proxy_forwards_streaming_without_buffering(monkeypatch):
     async def fake_forward_request(req, full_path, sanitized_payload, stream=False):
         assert full_path == "chat/completions"
         assert stream is True
+        assert sanitized_payload["model"] == "gpt-4o"
         return JSONResponse({"ok": True})
 
     monkeypatch.setattr(privacy_app, "forward_request", fake_forward_request)
@@ -99,10 +103,42 @@ async def test_proxy_forwards_streaming_without_buffering(monkeypatch):
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-token"},
             json={
-                "model": "ai-chat",
+                "model": "gpt-4o-anonym",
                 "messages": [{"role": "user", "content": "Bonjour Alice Smith"}],
                 "stream": True,
             },
         )
 
     assert res.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_proxy_suffixes_model_list(monkeypatch):
+    privacy_app.settings.inbound_api_keys = ["test-token"]
+
+    async def fake_forward_request(req, full_path, sanitized_payload, stream=False):
+        assert full_path == "models"
+        return JSONResponse(
+            {
+                "object": "list",
+                "data": [
+                    {"id": "gpt-4o", "object": "model"},
+                    {"id": "embedding-model-anonym", "object": "model"},
+                ],
+            }
+        )
+
+    monkeypatch.setattr(privacy_app, "forward_request", fake_forward_request)
+
+    transport = ASGITransport(app=privacy_app.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+    assert res.status_code == 200
+    assert [model["id"] for model in res.json()["data"]] == [
+        "gpt-4o-anonym",
+        "embedding-model-anonym",
+    ]

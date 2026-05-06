@@ -28,7 +28,8 @@ UPSTREAM_API_KEY=''
 PRIVACY_MODEL_ID='openai/privacy-filter'
 DEVICE=auto
 TORCH_DTYPE=auto
-FILTER_OUTPUT=false
+FILTER_OUTPUT=true
+MODEL_SUFFIX='-anonym'
 ```
 
 ## Test
@@ -44,7 +45,7 @@ curl -s http://127.0.0.1:8088/v1/chat/completions \
   -H 'Authorization: Bearer change-me' \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "ai-chat",
+    "model": "gpt-4o-anonym",
     "messages": [
       {
         "role": "user",
@@ -63,8 +64,9 @@ curl -s http://127.0.0.1:8088/metrics \
 
 ## Notes production
 
-* Par défaut, le proxy filtre les entrées envoyées au LLM.
-* `FILTER_OUTPUT=true` permet aussi de filtrer les réponses, mais cela ajoute de la latence.
+* Par défaut, le proxy filtre les entrées envoyées au LLM et les réponses du LLM (`FILTER_OUTPUT=true`).
+* Les modèles exposés au client sont suffixés avec `-anonym` (`MODEL_SUFFIX`) et le suffixe est retiré avant envoi à l’upstream.
+* `FILTER_OUTPUT=false` permet de désactiver le filtrage des réponses si la latence est prioritaire.
 * Le modèle peut rater des PII, surtout hors anglais ou avec formats métier spécifiques.
 * Pour contexte gouvernement / médical / RH / finance, valider sur corpus interne et ajouter éventuellement règles regex métier ou fine-tuning.
   EOF

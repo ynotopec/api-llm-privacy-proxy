@@ -43,10 +43,11 @@ class Settings:
     device: str = os.getenv("DEVICE", "auto")
     torch_dtype: str = os.getenv("TORCH_DTYPE", "auto")
 
-    filter_output: bool = os.getenv("FILTER_OUTPUT", "false").lower() in ("1", "true", "yes", "on")
+    filter_output: bool = os.getenv("FILTER_OUTPUT", "true").lower() in ("1", "true", "yes", "on")
     min_entity_score: float = float(os.getenv("MIN_ENTITY_SCORE", "0.50"))
     max_string_chars: int = int(os.getenv("MAX_STRING_CHARS", "200000"))
     model_idle_unload_seconds: int = int(os.getenv("MODEL_IDLE_UNLOAD_SECONDS", "300"))
+    model_suffix: str = os.getenv("MODEL_SUFFIX", "-anonym")
 
     placeholder_style: str = os.getenv("PLACEHOLDER_STYLE", "typed_index")
     skip_json_keys: set = field(
@@ -64,6 +65,57 @@ class Settings:
 
 
 settings = Settings()
+
+
+def suffix_model_id(model_id: str) -> str:
+    if not settings.model_suffix or model_id.endswith(settings.model_suffix):
+        return model_id
+    return f"{model_id}{settings.model_suffix}"
+
+
+def unsuffix_model_id(model_id: str) -> str:
+    if settings.model_suffix and model_id.endswith(settings.model_suffix):
+        return model_id[: -len(settings.model_suffix)]
+    return model_id
+
+
+def unsuffix_model_path(full_path: str) -> str:
+    parts = full_path.split("/")
+    if len(parts) >= 2 and parts[0] == "models":
+        parts[1] = unsuffix_model_id(parts[1])
+    return "/".join(parts)
+
+
+def rewrite_request_model_ids(value: Any) -> Any:
+    if isinstance(value, list):
+        return [rewrite_request_model_ids(item) for item in value]
+
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key == "model" and isinstance(item, str):
+                out[key] = unsuffix_model_id(item)
+            else:
+                out[key] = rewrite_request_model_ids(item)
+        return out
+
+    return value
+
+
+def rewrite_response_model_ids(value: Any, *, models_endpoint: bool = False) -> Any:
+    if isinstance(value, list):
+        return [rewrite_response_model_ids(item, models_endpoint=models_endpoint) for item in value]
+
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if isinstance(item, str) and (key == "model" or (models_endpoint and key == "id")):
+                out[key] = suffix_model_id(item)
+            else:
+                out[key] = rewrite_response_model_ids(item, models_endpoint=models_endpoint)
+        return out
+
+    return value
 
 
 class GlobalMetrics:
@@ -364,6 +416,7 @@ async def health() -> Dict[str, Any]:
         "model": settings.privacy_model_id,
         "upstream": settings.upstream_base_url,
         "filter_output": settings.filter_output,
+        "model_suffix": settings.model_suffix,
     }
 
 
@@ -400,12 +453,37 @@ def build_upstream_headers(req: Request) -> Dict[str, str]:
     return headers
 
 
+def response_models_endpoint(full_path: str) -> bool:
+    return full_path == "models" or full_path.startswith("models/")
+
+
+def add_response_model_suffixes(upstream_resp: Response, full_path: str) -> Response:
+    ctype = upstream_resp.headers.get("content-type", "")
+    if "application/json" not in ctype:
+        return upstream_resp
+
+    try:
+        response_payload = json.loads(upstream_resp.body)
+    except Exception:
+        return upstream_resp
+
+    response_payload = rewrite_response_model_ids(
+        response_payload,
+        models_endpoint=response_models_endpoint(full_path),
+    )
+    return JSONResponse(
+        content=response_payload,
+        status_code=upstream_resp.status_code,
+        headers=dict(upstream_resp.headers),
+    )
+
 async def forward_request(
     req: Request,
     full_path: str,
     sanitized_payload: Any,
     stream: bool = False,
 ) -> Response:
+    full_path = unsuffix_model_path(full_path)
     url = f"{settings.upstream_base_url}/{full_path}"
 
     timeout = httpx.Timeout(600.0, connect=30.0)
@@ -479,7 +557,8 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
 
     if req.method in ("GET", "DELETE"):
         # Pas de body JSON à filtrer.
-        return await forward_request(req, full_path, sanitized_payload=None)
+        upstream_resp = await forward_request(req, full_path, sanitized_payload=None)
+        return add_response_model_suffixes(upstream_resp, full_path)
 
     try:
         payload = await req.json()
@@ -489,6 +568,7 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
     start = time.perf_counter()
 
     sanitized_payload, in_stats = await sanitizer.sanitize_payload(payload)
+    sanitized_payload = rewrite_request_model_ids(sanitized_payload)
     await metrics.add(in_stats.tokens, in_stats.spans, in_stats.labels)
 
     wants_stream = bool(isinstance(payload, dict) and payload.get("stream") is True)
@@ -502,28 +582,29 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
     upstream_resp.headers["x-privacy-filtered-spans"] = str(in_stats.spans)
     upstream_resp.headers["x-privacy-filter-latency-ms"] = str(round((time.perf_counter() - start) * 1000, 2))
 
-    if not settings.filter_output:
-        return upstream_resp
-
-    ctype = upstream_resp.headers.get("content-type", "")
+    rewritten_resp = add_response_model_suffixes(upstream_resp, full_path)
+    ctype = rewritten_resp.headers.get("content-type", "")
     if "application/json" not in ctype:
-        return upstream_resp
+        return rewritten_resp
 
     try:
-        response_payload = json.loads(upstream_resp.body)
+        response_payload = json.loads(rewritten_resp.body)
     except Exception:
-        return upstream_resp
+        return rewritten_resp
 
-    sanitized_response, out_stats = await sanitizer.sanitize_payload(response_payload)
-    await metrics.add(out_stats.tokens, out_stats.spans, out_stats.labels)
+    out_stats = RedactionStats()
+    if settings.filter_output:
+        response_payload, out_stats = await sanitizer.sanitize_payload(response_payload)
+        await metrics.add(out_stats.tokens, out_stats.spans, out_stats.labels)
 
     final = JSONResponse(
-        content=sanitized_response,
-        status_code=upstream_resp.status_code,
-        headers=dict(upstream_resp.headers),
+        content=response_payload,
+        status_code=rewritten_resp.status_code,
+        headers=dict(rewritten_resp.headers),
     )
-    final.headers["x-privacy-filtered-output-tokens"] = str(out_stats.tokens)
-    final.headers["x-privacy-filtered-output-spans"] = str(out_stats.spans)
+    if settings.filter_output:
+        final.headers["x-privacy-filtered-output-tokens"] = str(out_stats.tokens)
+        final.headers["x-privacy-filtered-output-spans"] = str(out_stats.spans)
     return final
 
 

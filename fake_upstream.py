@@ -7,6 +7,7 @@ async def chat(req: Request):
     return {
         "id": "chatcmpl-fake",
         "object": "chat.completion",
+        "model": body.get("model"),
         "received_by_upstream": body,
         "choices": [
             {
@@ -18,4 +19,14 @@ async def chat(req: Request):
                 "finish_reason": "stop"
             }
         ]
+    }
+
+
+@app.get("/v1/models")
+async def models():
+    return {
+        "object": "list",
+        "data": [
+            {"id": "gpt-4o", "object": "model"},
+        ],
     }
