@@ -1,4 +1,5 @@
 import os
+import gc
 import json
 import time
 import asyncio
@@ -45,6 +46,7 @@ class Settings:
     filter_output: bool = os.getenv("FILTER_OUTPUT", "false").lower() in ("1", "true", "yes", "on")
     min_entity_score: float = float(os.getenv("MIN_ENTITY_SCORE", "0.50"))
     max_string_chars: int = int(os.getenv("MAX_STRING_CHARS", "200000"))
+    model_idle_unload_seconds: int = int(os.getenv("MODEL_IDLE_UNLOAD_SECONDS", "300"))
 
     placeholder_style: str = os.getenv("PLACEHOLDER_STYLE", "typed_index")
     skip_json_keys: set = field(
@@ -152,9 +154,33 @@ class PrivacySanitizer:
     def __init__(self) -> None:
         self.tokenizer = None
         self.classifier = None
+        self._last_used_at = 0.0
         self._load_lock = asyncio.Lock()
 
+    def _touch(self) -> None:
+        self._last_used_at = time.monotonic()
+
+    def unload_if_idle(self) -> None:
+        if self.classifier is None:
+            return
+
+        timeout = settings.model_idle_unload_seconds
+        if timeout <= 0:
+            return
+
+        idle_for = time.monotonic() - self._last_used_at
+        if idle_for < timeout:
+            return
+
+        log.info("Unloading privacy model after %.1fs of inactivity", idle_for)
+        self.classifier = None
+        self.tokenizer = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     async def ensure_loaded(self) -> None:
+        self.unload_if_idle()
         if self.classifier is not None:
             return
 
@@ -199,6 +225,7 @@ class PrivacySanitizer:
             )
 
             log.info("Privacy model loaded")
+            self._touch()
 
     def count_tokens(self, text: str) -> int:
         if not text:
@@ -213,6 +240,8 @@ class PrivacySanitizer:
             return text
 
         await self.ensure_loaded()
+
+        self._touch()
 
         try:
             entities = self.classifier(text)
