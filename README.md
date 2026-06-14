@@ -1,4 +1,3 @@
-cat > README.md <<'EOF'
 # OpenAI Privacy Filter Proxy
 
 Proxy OpenAI-compatible `/v1/*` qui filtre les PII avec `openai/privacy-filter` avant transmission vers un backend LLM.
