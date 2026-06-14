@@ -134,11 +134,19 @@ class GlobalMetrics:
         self.filtered_spans_total = 0
         self.filtered_by_label: Dict[str, int] = {}
 
-    async def add(self, tokens: int, spans: int, labels: Dict[str, int]) -> None:
+    async def add(
+        self,
+        tokens: int,
+        spans: int,
+        labels: Dict[str, int],
+        *,
+        count_request: bool = True,
+    ) -> None:
         async with self.lock:
-            self.requests_total += 1
-            if tokens > 0 or spans > 0:
-                self.filtered_requests_total += 1
+            if count_request:
+                self.requests_total += 1
+                if tokens > 0 or spans > 0:
+                    self.filtered_requests_total += 1
             self.filtered_tokens_total += tokens
             self.filtered_spans_total += spans
             for k, v in labels.items():
@@ -618,7 +626,7 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
     out_stats = RedactionStats()
     if settings.filter_output:
         response_payload, out_stats = await sanitizer.sanitize_payload(response_payload)
-        await metrics.add(out_stats.tokens, out_stats.spans, out_stats.labels)
+        await metrics.add(out_stats.tokens, out_stats.spans, out_stats.labels, count_request=False)
 
     final = JSONResponse(
         content=response_payload,
