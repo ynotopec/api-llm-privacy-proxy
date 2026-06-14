@@ -239,3 +239,20 @@ async def test_proxy_rejects_empty_model_id(monkeypatch):
     assert blank_res.json()["detail"] == "invalid_model_id"
     assert suffix_only_res.status_code == 400
     assert suffix_only_res.json()["detail"] == "invalid_model_id"
+
+
+@pytest.mark.asyncio
+async def test_output_filtering_does_not_double_count_requests():
+    test_metrics = privacy_app.GlobalMetrics()
+
+    await test_metrics.add(2, 1, {"private_person": 1})
+    await test_metrics.add(3, 1, {"private_email": 1}, count_request=False)
+
+    prometheus = await test_metrics.prometheus()
+
+    assert "privacy_proxy_requests_total 1" in prometheus
+    assert "privacy_proxy_filtered_requests_total 1" in prometheus
+    assert "privacy_proxy_filtered_tokens_total 5" in prometheus
+    assert "privacy_proxy_filtered_spans_total 2" in prometheus
+    assert 'privacy_proxy_filtered_spans_by_label_total{label="private_email"} 1' in prometheus
+    assert 'privacy_proxy_filtered_spans_by_label_total{label="private_person"} 1' in prometheus
