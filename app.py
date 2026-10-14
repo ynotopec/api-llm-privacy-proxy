@@ -1,20 +1,19 @@
-import os
+import asyncio
 import gc
 import json
-import time
-import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
-
 
 load_dotenv()
 

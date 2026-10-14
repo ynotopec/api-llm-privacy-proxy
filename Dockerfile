@@ -1,39 +1,28 @@
 FROM python:3.12-slim AS builder
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml requirements.txt README.md app.py fake_upstream.py ./
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install .
 
-# ── runtime ──────────────────────────────────────────────────────
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PRIVACY_MODEL_ID=openai/privacy-filter
+    PATH="/opt/venv/bin:$PATH" \
+    HF_HOME=/data/huggingface
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        tini curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 proxy \
+    && useradd --uid 10001 --gid proxy --create-home proxy \
+    && mkdir -p /data/huggingface \
+    && chown proxy:proxy /data/huggingface
 
+COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
-
-COPY .env.example .env
-COPY app.py .
-COPY install.sh .
-COPY run.sh .
-COPY fake_upstream.py .
-
-# HF cache — user can mount a PVC here
-RUN mkdir -p /data/huggingface
-ENV HF_HOME=/data/huggingface
+USER 10001:10001
 EXPOSE 8088
-
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8088", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8088"]

@@ -1,6 +1,6 @@
 import pytest
-from httpx import AsyncClient, ASGITransport
 from fastapi.responses import JSONResponse
+from httpx import ASGITransport, AsyncClient
 
 import app as privacy_app
 

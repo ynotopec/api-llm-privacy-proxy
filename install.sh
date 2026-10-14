@@ -29,7 +29,7 @@ echo "==> Installing/upgrading dependencies..."
 source "$VENV_DIR/bin/activate"
 
 uv pip install --upgrade pip setuptools wheel
-uv pip install --upgrade -r requirements.txt
+uv pip install --upgrade '.[dev]'
 
 if [[ ! -f ".env" ]]; then
   cp .env.example .env

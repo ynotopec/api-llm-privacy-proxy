@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+
 app = FastAPI()
 
 @app.post("/v1/chat/completions")
