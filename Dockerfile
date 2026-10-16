@@ -15,10 +15,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends tini \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 proxy \
-    && useradd --uid 10001 --gid proxy --create-home proxy \
+    && groupadd --gid 10001 privacyproxy \
+    && useradd --uid 10001 --gid privacyproxy --create-home privacyproxy \
     && mkdir -p /data/huggingface \
-    && chown proxy:proxy /data/huggingface
+    && chown privacyproxy:privacyproxy /data/huggingface
 
 COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
