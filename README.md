@@ -13,10 +13,9 @@ Client OpenAI-compatible
 
 ```bash
 ./install.sh
-cp .env.example .env
 nano .env
 source run.sh 0.0.0.0 8088
-````
+```
 
 ## Variables importantes
 
@@ -31,11 +30,39 @@ FILTER_OUTPUT=true
 MODEL_SUFFIX='-anonym'
 ```
 
-## Test
+## Installation avec pip et tests
 
 ```bash
-pytest -q
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+python -m pytest -q
 ```
+
+`requirements.txt` reste la source des dépendances de production ; les outils de test sont dans l’extra `dev`.
+
+## Docker
+
+```bash
+docker build -t api-llm-privacy-proxy .
+docker run --rm --name privacy-proxy -p 8088:8088 \
+  --env-file .env \
+  -v privacy-hf-cache:/data/huggingface \
+  api-llm-privacy-proxy
+```
+
+Créer `.env` depuis `.env.example`, puis régler les tokens et `UPSTREAM_BASE_URL` avant le lancement. Dans le conteneur, `127.0.0.1` désigne le conteneur lui-même : utiliser le nom DNS ou l’adresse accessible du backend.
+
+Le conteneur tourne avec l’UID/GID `10001`. Un répertoire hôte monté pour le cache doit être inscriptible par cet utilisateur. Pour un GPU NVIDIA, ajouter `--gpus all` avec le NVIDIA Container Toolkit installé.
+
+Le port interne est `8088`. Pour le modifier, remplacer la commande :
+
+```bash
+docker run --rm --env-file .env -p 8090:8090 api-llm-privacy-proxy \
+  uvicorn app:app --host 0.0.0.0 --port 8090
+```
+
+Derrière un reverse proxy, configurer `--forwarded-allow-ips` avec les adresses des proxies de confiance.
 
 ## Appel OpenAI-compatible
 
@@ -69,13 +96,10 @@ curl -s http://127.0.0.1:8088/metrics \
 * `FILTER_OUTPUT=false` permet de désactiver le filtrage des réponses si la latence est prioritaire.
 * Le modèle peut rater des PII, surtout hors anglais ou avec formats métier spécifiques.
 * Pour contexte gouvernement / médical / RH / finance, valider sur corpus interne et ajouter éventuellement règles regex métier ou fine-tuning.
-  EOF
-
-````
 
 ---
 
-## 10. Service systemd exemple
+## Service systemd exemple
 
 ```bash
 sudo tee /etc/systemd/system/api-llm-privacy-proxy.service >/dev/null <<'EOF'

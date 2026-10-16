@@ -7,5 +7,3 @@ transformers>=4.56.0
 accelerate>=1.0.0
 safetensors>=0.4.5
 torch
-pytest>=8.3.0
-pytest-asyncio>=0.24.0

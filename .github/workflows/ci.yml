@@ -1,0 +1,35 @@
+name: Packaging and tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install '.[dev]' build
+      - run: python -m pytest -q
+      - run: python -m build
+      - run: python -m pip install --force-reinstall --no-deps dist/*.whl
+      - name: Import installed wheel outside source tree
+        run: cd /tmp && python -c 'import app, fake_upstream; assert app.app.title == "OpenAI Privacy Filter Proxy"'
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t privacy-proxy:test .
+      - name: Smoke test without loading the privacy model
+        run: |
+          docker run -d --name privacy-proxy -p 8088:8088 privacy-proxy:test
+          trap 'docker logs privacy-proxy; docker rm -f privacy-proxy' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail http://127.0.0.1:8088/health; then exit 0; fi
+            sleep 2
+          done
+          exit 1
