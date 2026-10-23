@@ -260,16 +260,33 @@ class PrivacySanitizer:
         while True:
             timeout = settings.model_idle_unload_seconds
             await asyncio.sleep(min(30.0, max(0.1, timeout / 2)) if timeout > 0 else 30.0)
+            if self._closed:
+                return
             if timeout > 0 and self._executor is not None and self._pending == 0:
-                await self._run(self.unload_if_idle)
+                # No suspension between this check and _run's admission. A newly
+                # admitted request can follow maintenance in FIFO and reload if needed.
+                try:
+                    await self._run(self.unload_if_idle)
+                except HTTPException as exc:
+                    if exc.status_code != 503:
+                        log.exception("Privacy model idle maintenance failed; will retry")
+                    else:
+                        log.debug("Privacy model idle maintenance deferred: worker busy")
+                except Exception:
+                    log.exception("Privacy model idle maintenance failed; will retry")
 
     async def aclose(self) -> None:
         self._closed = True
-        if self._executor is not None:
+        executor = self._executor
+        if executor is not None:
             # FIFO: release the model only after all admitted inferences finish.
-            await asyncio.get_running_loop().run_in_executor(self._executor, self._unload)
-            self._executor.shutdown(wait=True)
-            self._executor = None
+            try:
+                await asyncio.get_running_loop().run_in_executor(executor, self._unload)
+            finally:
+                try:
+                    await asyncio.to_thread(executor.shutdown, wait=True)
+                finally:
+                    self._executor = None
 
     def _touch(self) -> None:
         self._last_used_at = time.monotonic()
@@ -530,10 +547,14 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             watchdog.cancel()
-            with suppress(asyncio.CancelledError):
-                await watchdog
-            await owner.aclose()
-            app.state.upstream_client = None
+            try:
+                with suppress(asyncio.CancelledError):
+                    await watchdog
+            finally:
+                try:
+                    await owner.aclose()
+                finally:
+                    app.state.upstream_client = None
 
 
 app = FastAPI(title="OpenAI Privacy Filter Proxy", version="1.0.0", lifespan=lifespan)

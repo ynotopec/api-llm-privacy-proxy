@@ -222,6 +222,7 @@ async def test_idle_watchdog_unloads_without_waiting_for_a_new_request(monkeypat
 @pytest.mark.asyncio
 async def test_idle_watchdog_never_unloads_during_inference(monkeypatch):
     monkeypatch.setattr(app.settings, "model_idle_unload_seconds", 0.05)
+    monkeypatch.setattr(app.settings, "inference_max_pending", 1)
     entered, release = threading.Event(), threading.Event()
 
     def classify(texts, **kwargs):
@@ -236,6 +237,7 @@ async def test_idle_watchdog_never_unloads_during_inference(monkeypatch):
         await wait_for_event(entered)
         await asyncio.sleep(0.15)
         assert sanitizer.classifier is classify
+        assert not watchdog.done()
         release.set()
         await task
         assert time.monotonic() - sanitizer._last_used_at < 0.05
@@ -245,6 +247,69 @@ async def test_idle_watchdog_never_unloads_during_inference(monkeypatch):
         with suppress(asyncio.CancelledError):
             await watchdog
         await sanitizer.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [HTTPException(status_code=503), RuntimeError("unload failed")])
+async def test_idle_watchdog_retries_after_a_forced_maintenance_failure(monkeypatch, failure, caplog):
+    monkeypatch.setattr(app.settings, "model_idle_unload_seconds", 0.05)
+    sanitizer = ready_sanitizer(lambda texts, **kwargs: [[] for text in texts])
+    await sanitizer.sanitize_payload("warm")
+    original_run = sanitizer._run
+    unloaded = threading.Event()
+    attempts = []
+
+    async def fail_once(func, *args):
+        attempts.append(True)
+        if len(attempts) == 1:
+            # Force a rejection: normal idle admission has no intervening await.
+            raise failure
+        result = await original_run(func, *args)
+        if sanitizer.classifier is None:
+            unloaded.set()
+        return result
+
+    monkeypatch.setattr(sanitizer, "_run", fail_once)
+    watchdog = asyncio.create_task(sanitizer.idle_watchdog())
+    try:
+        await wait_for_event(unloaded)
+        assert len(attempts) >= 2
+        assert not watchdog.done()
+        if isinstance(failure, RuntimeError):
+            assert "Privacy model idle maintenance failed; will retry" in caplog.text
+    finally:
+        watchdog.cancel()
+        with suppress(asyncio.CancelledError):
+            await watchdog
+        await sanitizer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_executor_shutdown_does_not_block_health(monkeypatch):
+    sanitizer = ready_sanitizer(lambda texts, **kwargs: [[] for text in texts])
+    await sanitizer.sanitize_payload("warm")
+    entered, release = threading.Event(), threading.Event()
+    original_shutdown = sanitizer._executor.shutdown
+    loop_thread = threading.get_ident()
+
+    def slow_shutdown(*args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        entered.set()
+        assert release.wait(3)
+        original_shutdown(*args, **kwargs)
+
+    monkeypatch.setattr(sanitizer._executor, "shutdown", slow_shutdown)
+    close = asyncio.create_task(sanitizer.aclose())
+    try:
+        await wait_for_event(entered)
+        async with AsyncClient(transport=ASGITransport(app=app.app), base_url="http://test") as client:
+            response = await asyncio.wait_for(client.get("/health"), 1)
+        assert response.status_code == 200
+        assert not close.done()
+    finally:
+        release.set()
+        await close
+    assert sanitizer._executor is None
 
 
 @pytest.mark.asyncio
