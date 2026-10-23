@@ -3,6 +3,14 @@
 Proxy OpenAI-compatible (`/v1/*`) qui filtre les PII avec `openai/privacy-filter`
 avant transmission vers un backend LLM.
 
+Le modèle est utilisé exclusivement dans un thread dédié par worker HTTP, avec admission bornée
+(`INFERENCE_MAX_PENDING`). Les textes sont dédupliqués par opération puis inférés par petits lots.
+Le client HTTP et son pool vivent dans le lifespan FastAPI ; aucun cookie amont n’est conservé.
+Les détails de configuration et de mesure sont dans la section « Charge et mémoire » du README.
+
+Les réponses streaming restent un relais sans filtrage de sortie : `stream=true` exige donc
+`FILTER_OUTPUT=false`, sinon le proxy refuse la requête en HTTP 400 avant l’inférence.
+
 ---
 
 ## Flux de requête
@@ -102,7 +110,7 @@ graph TD
     B -->|list| F{Item liste}
 
     D --> G{Max chars<br/>atteint}
-    G -->|oui| C
+    G -->|oui| R[HTTP 413]
     G -->|non| H[Tokenisation]
 
     H --> I[NLP Inference<br/>token-classification]
@@ -204,6 +212,7 @@ sequenceDiagram
     Note right of TM: chaque appel sanitize_text
 
     ID->>ID: idle_for = now - _last_used_at
+    Note over ID,S: Surveillance en arrière-plan, seulement sans opération active ou en attente
 
     alt idle_for > timeout 300s
         ID->>GC: classifier = None<br/>tokenizer = None<br/>gc.collect<br/>torch.cuda.empty_cache
