@@ -8,8 +8,11 @@ Le modèle est utilisé exclusivement dans un thread dédié par worker HTTP, av
 Le client HTTP et son pool vivent dans le lifespan FastAPI ; aucun cookie amont n’est conservé.
 Les détails de configuration et de mesure sont dans la section « Charge et mémoire » du README.
 
-Les réponses streaming restent un relais sans filtrage de sortie : `stream=true` exige donc
-`FILTER_OUTPUT=false`, sinon le proxy refuse la requête en HTTP 400 avant l’inférence.
+Avec `FILTER_OUTPUT=true`, le streaming de `chat/completions` et `completions` est produit à partir
+de la réponse JSON complète, après filtrage : conversion des messages en deltas SSE, événements
+de fin, usage si demandé et `[DONE]`. Aucun texte de sortie ne part avant la fin du filtrage.
+Avec `FILTER_OUTPUT=false`, le flux SSE amont est relayé directement, sans filtrage de sortie.
+Le streaming filtré des autres endpoints (dont `responses`) reste refusé explicitement.
 
 ---
 

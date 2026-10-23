@@ -94,7 +94,8 @@ curl -s http://127.0.0.1:8088/metrics \
 * Les modèles exposés au client sont suffixés avec `-anonym` (`MODEL_SUFFIX`) et seul le champ `model` OpenAI de premier niveau est désuffixé avant envoi à l’upstream.
 * Les configurations utilisateur comme `thinking` / `reasoning` sont préservées telles quelles par défaut.
 * `FILTER_OUTPUT=false` permet de désactiver le filtrage des réponses si la latence est prioritaire.
-* **Streaming :** avec `FILTER_OUTPUT=true`, `stream=true` est refusé en HTTP 400 avant l’inférence. Pour conserver le streaming SSE avec filtrage des entrées seulement, configurer `FILTER_OUTPUT=false`. Auparavant, le streaming contournait silencieusement le filtrage de sortie. Le flux amont reste transmis sans réécriture des identifiants de modèle.
+* **Streaming :** avec `FILTER_OUTPUT=true`, `/v1/chat/completions` et `/v1/completions` acceptent `stream=true`. Le proxy demande une réponse JSON complète à l’amont, filtre cette réponse, puis la renvoie en SSE compatible OpenAI (contenu, appels d’outils, fin et `[DONE]` ; usage si demandé). Le premier texte est donc affiché après la génération complète et le filtrage. Cela permet de traiter une PII qui serait répartie sur plusieurs fragments SSE. L’en-tête `x-privacy-stream-mode: buffered` identifie ce mode. Prévoir un timeout client/reverse proxy adapté aux générations longues.
+* Avec `FILTER_OUTPUT=false`, le streaming amont reste relayé directement et seules les entrées sont filtrées ; les identifiants de modèle du flux restent transmis tels quels. Le streaming filtré de l’API `/v1/responses` n’est pas implémenté et reste refusé explicitement.
 * Une chaîne filtrable dépassant `MAX_STRING_CHARS` est refusée en HTTP 413, au lieu d’être transmise sans filtrage. Cette limite en caractères ne remplace pas la fenêtre de contexte du modèle ni une limite HTTP globale au reverse proxy.
 * Le modèle peut rater des PII, surtout hors anglais ou avec formats métier spécifiques.
 * Pour contexte gouvernement / médical / RH / finance, valider sur corpus interne et ajouter éventuellement règles regex métier ou fine-tuning.
@@ -116,7 +117,7 @@ Chaque worker Uvicorn possède son propre modèle, sa file et ses métriques : a
 * `x-privacy-filter-input-latency-ms` : filtrage d’entrée, incluant son attente dans la file et le chargement éventuel.
 * `x-privacy-filter-output-latency-ms` : filtrage de sortie JSON lorsqu’il est activé.
 * `x-privacy-filter-latency-ms` : somme des filtrages d’entrée et de sortie, **sans le temps du LLM amont** (correction du comportement précédent).
-* `x-upstream-latency-ms` : appel amont ; en streaming, mesure seulement jusqu’à la réception des en-têtes.
+* `x-upstream-latency-ms` : appel amont ; en streaming direct, mesure seulement jusqu’à la réception des en-têtes. En SSE filtré avec réponse assemblée, inclut la génération complète.
 
 Les tests incluent la concurrence, les déconnexions, le cycle de vie, les lots et un petit modèle Transformers local sans téléchargement. Ils ne constituent pas un benchmark du modèle `openai/privacy-filter` sur GPU.
 

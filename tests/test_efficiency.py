@@ -248,13 +248,13 @@ async def test_idle_watchdog_never_unloads_during_inference(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invalid_model_and_protected_stream_rejected_before_inference():
+async def test_invalid_model_and_unsupported_stream_rejected_before_inference():
     async with AsyncClient(transport=ASGITransport(app=app.app), base_url="http://test") as client:
         invalid = await client.post("/v1/chat/completions", json={"model": "-anonym", "messages": ["hello"]})
-        stream = await client.post("/v1/chat/completions", json={"model": "valid", "stream": True})
+        stream = await client.post("/v1/responses", json={"model": "valid", "stream": True})
     assert invalid.status_code == 400
     assert stream.status_code == 400
-    assert "FILTER_OUTPUT=false" in stream.json()["detail"]
+    assert stream.json()["detail"] == "filtered_streaming_supported_for_chat_and_text_completions_only"
     assert app.sanitizer._executor is None
 
 
