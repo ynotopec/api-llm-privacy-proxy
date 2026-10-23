@@ -4,7 +4,10 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -12,7 +15,6 @@ import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
-from starlette.background import BackgroundTask
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
 load_dotenv()
@@ -47,6 +49,11 @@ class Settings:
     max_string_chars: int = int(os.getenv("MAX_STRING_CHARS", "200000"))
     model_idle_unload_seconds: int = int(os.getenv("MODEL_IDLE_UNLOAD_SECONDS", "300"))
     model_suffix: str = os.getenv("MODEL_SUFFIX", "-anonym")
+    inference_max_pending: int = max(1, int(os.getenv("INFERENCE_MAX_PENDING", "8")))
+    inference_batch_size: int = max(1, int(os.getenv("INFERENCE_BATCH_SIZE", "4")))
+    inference_batch_max_chars: int = max(1, int(os.getenv("INFERENCE_BATCH_MAX_CHARS", "32768")))
+    upstream_max_connections: int = max(1, int(os.getenv("UPSTREAM_MAX_CONNECTIONS", "100")))
+    upstream_max_keepalive_connections: int = max(0, int(os.getenv("UPSTREAM_MAX_KEEPALIVE_CONNECTIONS", "20")))
 
     placeholder_style: str = os.getenv("PLACEHOLDER_STYLE", "typed_index")
     skip_json_keys: set = field(
@@ -197,6 +204,7 @@ class RedactionContext:
     def __init__(self) -> None:
         self.by_value: Dict[Tuple[str, str], str] = {}
         self.next_index: Dict[str, int] = {}
+        self.token_counts: Dict[str, int] = {}
 
     def placeholder(self, label: str, value: str) -> str:
         label = normalize_label(label)
@@ -221,7 +229,64 @@ class PrivacySanitizer:
         self.tokenizer = None
         self.classifier = None
         self._last_used_at = 0.0
-        self._load_lock = asyncio.Lock()
+        self._executor = None
+        self._pending = 0
+        self._closed = False
+
+    async def _run(self, func, *args):
+        # All model access uses one dedicated thread, including loading and unloading.
+        # Keep admission occupied until the thread finishes even if its caller disconnects.
+        if self._closed or self._pending >= settings.inference_max_pending:
+            raise HTTPException(status_code=503, detail="privacy_filter_busy", headers={"Retry-After": "1"})
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="privacy-filter")
+        self._pending += 1
+        try:
+            future = asyncio.get_running_loop().run_in_executor(self._executor, func, *args)
+        except BaseException:
+            self._pending -= 1
+            raise
+
+        def finished(done):
+            self._pending -= 1
+            # Retrieve exceptions from work whose HTTP caller has been cancelled.
+            if not done.cancelled():
+                done.exception()
+
+        future.add_done_callback(finished)
+        return await asyncio.shield(future)
+
+    async def idle_watchdog(self) -> None:
+        while True:
+            timeout = settings.model_idle_unload_seconds
+            await asyncio.sleep(min(30.0, max(0.1, timeout / 2)) if timeout > 0 else 30.0)
+            if self._closed:
+                return
+            if timeout > 0 and self._executor is not None and self._pending == 0:
+                # No suspension between this check and _run's admission. A newly
+                # admitted request can follow maintenance in FIFO and reload if needed.
+                try:
+                    await self._run(self.unload_if_idle)
+                except HTTPException as exc:
+                    if exc.status_code != 503:
+                        log.exception("Privacy model idle maintenance failed; will retry")
+                    else:
+                        log.debug("Privacy model idle maintenance deferred: worker busy")
+                except Exception:
+                    log.exception("Privacy model idle maintenance failed; will retry")
+
+    async def aclose(self) -> None:
+        self._closed = True
+        executor = self._executor
+        if executor is not None:
+            # FIFO: release the model only after all admitted inferences finish.
+            try:
+                await asyncio.get_running_loop().run_in_executor(executor, self._unload)
+            finally:
+                try:
+                    await asyncio.to_thread(executor.shutdown, wait=True)
+                finally:
+                    self._executor = None
 
     def _touch(self) -> None:
         self._last_used_at = time.monotonic()
@@ -239,59 +304,58 @@ class PrivacySanitizer:
             return
 
         log.info("Unloading privacy model after %.1fs of inactivity", idle_for)
+        self._unload()
+
+    def _unload(self) -> None:
         self.classifier = None
         self.tokenizer = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    async def ensure_loaded(self) -> None:
-        self.unload_if_idle()
+    def ensure_loaded(self) -> None:
         if self.classifier is not None:
             return
 
-        async with self._load_lock:
-            if self.classifier is not None:
-                return
+        log.info("Loading privacy model: %s", settings.privacy_model_id)
 
-            log.info("Loading privacy model: %s", settings.privacy_model_id)
+        dtype = None
+        if settings.torch_dtype == "bf16":
+            dtype = torch.bfloat16
+        elif settings.torch_dtype == "fp16":
+            dtype = torch.float16
+        elif settings.torch_dtype == "fp32":
+            dtype = torch.float32
 
-            dtype = None
-            if settings.torch_dtype == "bf16":
-                dtype = torch.bfloat16
-            elif settings.torch_dtype == "fp16":
-                dtype = torch.float16
-            elif settings.torch_dtype == "fp32":
-                dtype = torch.float32
+        tokenizer = AutoTokenizer.from_pretrained(settings.privacy_model_id)
 
-            self.tokenizer = AutoTokenizer.from_pretrained(settings.privacy_model_id)
+        model_kwargs = {}
+        if dtype is not None:
+            model_kwargs["torch_dtype"] = dtype
 
-            model_kwargs = {}
-            if dtype is not None:
-                model_kwargs["torch_dtype"] = dtype
+        if settings.device == "cuda":
+            model_kwargs["device_map"] = "cuda"
+        elif settings.device == "cpu":
+            model_kwargs["device_map"] = "cpu"
+        else:
+            model_kwargs["device_map"] = "auto"
 
-            if settings.device == "cuda":
-                model_kwargs["device_map"] = "cuda"
-            elif settings.device == "cpu":
-                model_kwargs["device_map"] = "cpu"
-            else:
-                model_kwargs["device_map"] = "auto"
+        model = AutoModelForTokenClassification.from_pretrained(
+            settings.privacy_model_id,
+            **model_kwargs,
+        )
+        model.eval()
 
-            model = AutoModelForTokenClassification.from_pretrained(
-                settings.privacy_model_id,
-                **model_kwargs,
-            )
-            model.eval()
+        self.classifier = pipeline(
+            task="token-classification",
+            model=model,
+            tokenizer=tokenizer,
+            aggregation_strategy="simple",
+        )
 
-            self.classifier = pipeline(
-                task="token-classification",
-                model=model,
-                tokenizer=self.tokenizer,
-                aggregation_strategy="simple",
-            )
-
-            log.info("Privacy model loaded")
-            self._touch()
+        self.tokenizer = tokenizer
+        log.info("Privacy model loaded")
+        self._touch()
 
     def count_tokens(self, text: str) -> int:
         if not text:
@@ -301,19 +365,53 @@ class PrivacySanitizer:
         except Exception:
             return max(1, len(text.split()))
 
-    async def sanitize_text(self, text: str, ctx: RedactionContext, stats: RedactionStats) -> str:
-        if not text or len(text) > settings.max_string_chars:
-            return text
+    def _infer(self, texts: List[str]) -> Dict[str, list]:
+        if not texts:
+            return {}
+        self.ensure_loaded()
+        batch_size = settings.inference_batch_size if self.tokenizer.pad_token_id is not None else 1
+        result = {}
+        batch = []
+        chars = 0
 
-        await self.ensure_loaded()
-
-        self._touch()
+        def flush():
+            # Bound padding costs and keep DataLoader workers out of the model thread.
+            with torch.inference_mode():
+                predictions = self.classifier(batch, batch_size=len(batch), num_workers=0)
+            result.update(zip(batch, predictions))
 
         try:
-            entities = self.classifier(text)
-        except Exception as e:
+            for text in texts:
+                if batch and (len(batch) >= batch_size
+                              or chars + len(text) > settings.inference_batch_max_chars):
+                    flush()
+                    batch = []
+                    chars = 0
+                batch.append(text)
+                chars += len(text)
+            if batch:
+                flush()
+        except Exception:
             log.exception("Privacy model inference failed")
-            raise HTTPException(status_code=500, detail=f"privacy_filter_failed: {e}")
+            raise HTTPException(status_code=500, detail="privacy_filter_failed") from None
+        finally:
+            self._touch()
+        return result
+
+    @staticmethod
+    def _validate_text(text: str) -> None:
+        if len(text) > settings.max_string_chars:
+            raise HTTPException(status_code=413, detail="privacy_string_too_long")
+
+    async def sanitize_text(self, text: str, ctx: RedactionContext, stats: RedactionStats) -> str:
+        self._validate_text(text)
+        if not text:
+            return text
+        return await self._run(self._sanitize_text_sync, text, ctx, stats)
+
+    def _sanitize_text_sync(self, text, ctx, stats, entities=None):
+        if entities is None:
+            entities = self._infer([text])[text]
 
         spans = []
         for ent in entities:
@@ -364,45 +462,102 @@ class PrivacySanitizer:
             out.append(replacement)
             last = end
 
-            stats.add(label, self.count_tokens(original))
+            if original not in ctx.token_counts:
+                ctx.token_counts[original] = self.count_tokens(original)
+            stats.add(label, ctx.token_counts[original])
 
         out.append(text[last:])
         return "".join(out)
 
     async def sanitize_payload(self, payload: Any) -> Tuple[Any, RedactionStats]:
+        return await self._run(self._sanitize_payload_sync, payload)
+
+    def _sanitize_payload_sync(self, payload: Any) -> Tuple[Any, RedactionStats]:
+        # Cache only inside this operation: no PII retained across requests.
+        texts = {}
+
+        def collect(value, parent_key=None):
+            if parent_key in settings.skip_json_keys:
+                return
+            if isinstance(value, str):
+                self._validate_text(value)
+                if value:
+                    texts[value] = None
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    collect(item, str(key))
+
+        collect(payload)
+        predictions = self._infer(list(texts))
         ctx = RedactionContext()
         stats = RedactionStats()
-        sanitized = await self._sanitize_any(payload, ctx, stats, parent_key=None)
+        sanitized = self._sanitize_any(payload, ctx, stats, None, predictions)
         return sanitized, stats
 
-    async def _sanitize_any(
+    def _sanitize_any(
         self,
         value: Any,
         ctx: RedactionContext,
         stats: RedactionStats,
         parent_key: Optional[str],
+        predictions: Dict[str, list],
     ) -> Any:
         if parent_key in settings.skip_json_keys:
             return value
-
         if isinstance(value, str):
-            return await self.sanitize_text(value, ctx, stats)
-
+            if not value:
+                return value
+            return self._sanitize_text_sync(value, ctx, stats, predictions[value])
         if isinstance(value, list):
-            return [await self._sanitize_any(v, ctx, stats, parent_key=None) for v in value]
-
+            return [self._sanitize_any(v, ctx, stats, None, predictions) for v in value]
         if isinstance(value, dict):
-            out = {}
-            for k, v in value.items():
-                out[k] = await self._sanitize_any(v, ctx, stats, parent_key=str(k))
-            return out
-
+            return {k: self._sanitize_any(v, ctx, stats, str(k), predictions) for k, v in value.items()}
         return value
 
 
 sanitizer = PrivacySanitizer()
 
-app = FastAPI(title="OpenAI Privacy Filter Proxy", version="1.0.0")
+
+class NoUpstreamCookies(DefaultCookiePolicy):
+    def set_ok(self, cookie, request):
+        # The pool is shared by different users, never persist upstream sessions.
+        return False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global sanitizer
+    if sanitizer._closed:
+        sanitizer = PrivacySanitizer()
+    owner = sanitizer
+    limits = httpx.Limits(
+        max_connections=settings.upstream_max_connections,
+        max_keepalive_connections=min(settings.upstream_max_keepalive_connections, settings.upstream_max_connections),
+    )
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(600.0, connect=30.0, pool=30.0), limits=limits,
+        cookies=CookieJar(policy=NoUpstreamCookies()),
+    ) as client:
+        app.state.upstream_client = client
+        watchdog = asyncio.create_task(owner.idle_watchdog())
+        try:
+            yield
+        finally:
+            watchdog.cancel()
+            try:
+                with suppress(asyncio.CancelledError):
+                    await watchdog
+            finally:
+                try:
+                    await owner.aclose()
+                finally:
+                    app.state.upstream_client = None
+
+
+app = FastAPI(title="OpenAI Privacy Filter Proxy", version="1.0.0", lifespan=lifespan)
 
 
 def extract_bearer(req: Request) -> str:
@@ -468,7 +623,7 @@ def build_upstream_headers(req: Request) -> Dict[str, str]:
     return headers
 
 
-def headers_for_modified_body(resp: Response) -> Dict[str, str]:
+def headers_for_modified_body(resp: Response | httpx.Response) -> Dict[str, str]:
     excluded = {
         "content-length",
         "content-encoding",
@@ -516,66 +671,109 @@ async def forward_request(
     full_path = unsuffix_model_path(full_path)
     url = f"{settings.upstream_base_url}/{full_path}"
 
-    timeout = httpx.Timeout(600.0, connect=30.0)
+    client = getattr(req.app.state, "upstream_client", None)
+    if client is None:
+        raise HTTPException(status_code=503, detail="upstream_client_not_ready")
+    upstream_req = client.build_request(
+        method=req.method,
+        url=url,
+        headers=build_upstream_headers(req),
+        params=req.query_params.multi_items(),
+        json=sanitized_payload,
+    )
+    try:
+        upstream = await client.send(upstream_req, stream=stream)
+    except httpx.PoolTimeout:
+        raise HTTPException(status_code=503, detail="upstream_busy", headers={"Retry-After": "1"}) from None
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="upstream_timeout") from None
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="upstream_unavailable") from None
 
+    content_type = upstream.headers.get("content-type", "application/json")
+    headers = headers_for_modified_body(upstream)
     if stream:
-        client = httpx.AsyncClient(timeout=timeout)
-        upstream_req = client.build_request(
-            method=req.method,
-            url=url,
-            headers=build_upstream_headers(req),
-            params=dict(req.query_params),
-            json=sanitized_payload,
-        )
-        upstream_stream = await client.send(upstream_req, stream=True)
-        async def close_upstream() -> None:
-            await upstream_stream.aclose()
-            await client.aclose()
+        async def body():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await asyncio.shield(upstream.aclose())
 
-        content_type = upstream_stream.headers.get("content-type", "application/json")
-        headers = {
-            k: v
-            for k, v in upstream_stream.headers.items()
-            if k.lower() not in {"content-length", "connection"}
-        }
-        return StreamingResponse(
-            upstream_stream.aiter_bytes(),
-            status_code=upstream_stream.status_code,
-            headers=headers,
-            media_type=content_type,
-            background=BackgroundTask(close_upstream),
-        )
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        upstream = await client.request(
-            method=req.method,
-            url=url,
-            headers=build_upstream_headers(req),
-            params=dict(req.query_params),
-            json=sanitized_payload,
-        )
-
-        content_type = upstream.headers.get("content-type", "application/json")
-
-        excluded_resp_headers = {
-            "content-length",
-            "content-encoding",
-            "transfer-encoding",
-            "connection",
-        }
-
-        headers = {
-            k: v
-            for k, v in upstream.headers.items()
-            if k.lower() not in excluded_resp_headers
-        }
-
-        return Response(
-            content=upstream.content,
+        return UpstreamStreamingResponse(
+            upstream,
+            body(),
             status_code=upstream.status_code,
             headers=headers,
             media_type=content_type,
         )
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=headers,
+        media_type=content_type,
+    )
+
+
+class UpstreamStreamingResponse(StreamingResponse):
+    def __init__(self, upstream: httpx.Response, *args, **kwargs):
+        self.upstream = upstream
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Also covers disconnects/send failures before the body iterator starts.
+            await asyncio.shield(self.upstream.aclose())
+
+
+def buffered_completion_response(payload: Any, full_path: str, headers: Dict[str, str], include_usage: bool) -> Response:
+    """Emit SSE only after the entire completion has passed output filtering.
+
+    Asking upstream for JSON avoids forwarding PII split across arbitrary SSE deltas,
+    including streamed tool arguments. This deliberately delays the first content chunk.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
+        raise HTTPException(status_code=502, detail="invalid_upstream_completion")
+    chat = full_path.rstrip("/") == "chat/completions"
+    base = {key: value for key, value in payload.items() if key not in {"choices", "usage"}}
+    if chat:
+        base["object"] = "chat.completion.chunk"
+    chunks = []
+    finished = []
+    for choice in payload["choices"]:
+        if not isinstance(choice, dict):
+            raise HTTPException(status_code=502, detail="invalid_upstream_completion")
+        if chat:
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                raise HTTPException(status_code=502, detail="invalid_upstream_completion")
+            delta = dict(message)
+            calls = delta.get("tool_calls")
+            if isinstance(calls, list):
+                if any(not isinstance(call, dict) for call in calls):
+                    raise HTTPException(status_code=502, detail="invalid_upstream_completion")
+                delta["tool_calls"] = [{**call, "index": i} for i, call in enumerate(calls)]
+            chunk = {**choice, "delta": delta, "finish_reason": None}
+            chunk.pop("message", None)
+            end = {"index": choice.get("index", 0), "delta": {}, "finish_reason": choice.get("finish_reason")}
+        else:
+            chunk = {**choice, "finish_reason": None}
+            end = {"index": choice.get("index", 0), "text": "", "finish_reason": choice.get("finish_reason")}
+        chunks.append(chunk)
+        finished.append(end)
+
+    async def events():
+        for choices in (chunks, finished):
+            yield "data: " + json.dumps({**base, "choices": choices}, ensure_ascii=False) + "\n\n"
+        if include_usage and "usage" in payload:
+            yield "data: " + json.dumps({**base, "choices": [], "usage": payload["usage"]}, ensure_ascii=False) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    headers = {key: value for key, value in headers.items() if key.lower() not in {"content-type", "etag", "content-md5"}}
+    headers["x-privacy-stream-mode"] = "buffered"
+    return StreamingResponse(events(), headers=headers, media_type="text/event-stream")
 
 
 @app.api_route("/v1/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -595,47 +793,73 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
     except Exception:
         raise HTTPException(status_code=400, detail="expected_json_body")
 
-    start = time.perf_counter()
+    # Reject invalid requests before paying for model loading/inference.
+    payload = rewrite_request_model_ids(payload)
+    wants_stream = bool(isinstance(payload, dict) and payload.get("stream") is True)
+    buffered_stream = wants_stream and settings.filter_output
+    if buffered_stream and full_path.rstrip("/") not in {"chat/completions", "completions"}:
+        raise HTTPException(
+            status_code=400,
+            detail="filtered_streaming_supported_for_chat_and_text_completions_only",
+        )
 
+    start = time.perf_counter()
     sanitized_payload, in_stats = await sanitizer.sanitize_payload(payload)
-    sanitized_payload = rewrite_request_model_ids(sanitized_payload)
+    input_ms = (time.perf_counter() - start) * 1000
     await metrics.add(in_stats.tokens, in_stats.spans, in_stats.labels)
 
-    wants_stream = bool(isinstance(payload, dict) and payload.get("stream") is True)
-    if wants_stream:
-        return await forward_request(req, full_path, sanitized_payload, stream=True)
+    if buffered_stream:
+        sanitized_payload = {**sanitized_payload, "stream": False}
+        sanitized_payload.pop("stream_options", None)
 
-    upstream_resp = await forward_request(req, full_path, sanitized_payload, stream=False)
-
-    # Ajout headers utiles.
+    upstream_start = time.perf_counter()
+    upstream_resp = await forward_request(req, full_path, sanitized_payload, stream=wants_stream and not buffered_stream)
+    upstream_ms = (time.perf_counter() - upstream_start) * 1000
     upstream_resp.headers["x-privacy-filtered-tokens"] = str(in_stats.tokens)
     upstream_resp.headers["x-privacy-filtered-spans"] = str(in_stats.spans)
-    upstream_resp.headers["x-privacy-filter-latency-ms"] = str(round((time.perf_counter() - start) * 1000, 2))
+    upstream_resp.headers["x-privacy-filter-input-latency-ms"] = str(round(input_ms, 2))
+    upstream_resp.headers["x-privacy-filter-latency-ms"] = str(round(input_ms, 2))
+    upstream_resp.headers["x-upstream-latency-ms"] = str(round(upstream_ms, 2))
+    if wants_stream and not buffered_stream:
+        return upstream_resp
 
-    rewritten_resp = add_response_model_suffixes(upstream_resp, full_path)
-    ctype = rewritten_resp.headers.get("content-type", "")
+    ctype = upstream_resp.headers.get("content-type", "")
     if "application/json" not in ctype:
-        return rewritten_resp
+        if buffered_stream:
+            raise HTTPException(status_code=502, detail="expected_json_completion_for_filtered_stream")
+        return upstream_resp
 
     try:
-        response_payload = json.loads(rewritten_resp.body)
-    except Exception:
-        return rewritten_resp
+        response_payload = json.loads(upstream_resp.body)
+    except (ValueError, UnicodeError):
+        if buffered_stream:
+            raise HTTPException(status_code=502, detail="invalid_upstream_completion") from None
+        return upstream_resp
 
+    response_payload = rewrite_response_model_ids(
+        response_payload, models_endpoint=response_models_endpoint(full_path),
+    )
     out_stats = RedactionStats()
+    output_start = time.perf_counter()
+    output_ms = 0.0
     if settings.filter_output:
         response_payload, out_stats = await sanitizer.sanitize_payload(response_payload)
+        output_ms = (time.perf_counter() - output_start) * 1000
         await metrics.add(out_stats.tokens, out_stats.spans, out_stats.labels, count_request=False)
 
-    final = JSONResponse(
-        content=response_payload,
-        status_code=rewritten_resp.status_code,
-        headers=headers_for_modified_body(rewritten_resp),
-    )
+    headers = headers_for_modified_body(upstream_resp)
     if settings.filter_output:
-        final.headers["x-privacy-filtered-output-tokens"] = str(out_stats.tokens)
-        final.headers["x-privacy-filtered-output-spans"] = str(out_stats.spans)
-    return final
+        headers["x-privacy-filtered-output-tokens"] = str(out_stats.tokens)
+        headers["x-privacy-filtered-output-spans"] = str(out_stats.spans)
+        headers["x-privacy-filter-output-latency-ms"] = str(round(output_ms, 2))
+        headers["x-privacy-filter-latency-ms"] = str(round(input_ms + output_ms, 2))
+    if buffered_stream and 200 <= upstream_resp.status_code < 300:
+        stream_options = payload.get("stream_options")
+        include_usage = isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+        return buffered_completion_response(
+            response_payload, full_path, headers, include_usage,
+        )
+    return JSONResponse(content=response_payload, status_code=upstream_resp.status_code, headers=headers)
 
 
 if __name__ == "__main__":

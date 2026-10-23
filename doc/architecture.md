@@ -3,6 +3,17 @@
 Proxy OpenAI-compatible (`/v1/*`) qui filtre les PII avec `openai/privacy-filter`
 avant transmission vers un backend LLM.
 
+Le modèle est utilisé exclusivement dans un thread dédié par worker HTTP, avec admission bornée
+(`INFERENCE_MAX_PENDING`). Les textes sont dédupliqués par opération puis inférés par petits lots.
+Le client HTTP et son pool vivent dans le lifespan FastAPI ; aucun cookie amont n’est conservé.
+Les détails de configuration et de mesure sont dans la section « Charge et mémoire » du README.
+
+Avec `FILTER_OUTPUT=true`, le streaming de `chat/completions` et `completions` est produit à partir
+de la réponse JSON complète, après filtrage : conversion des messages en deltas SSE, événements
+de fin, usage si demandé et `[DONE]`. Aucun texte de sortie ne part avant la fin du filtrage.
+Avec `FILTER_OUTPUT=false`, le flux SSE amont est relayé directement, sans filtrage de sortie.
+Le streaming filtré des autres endpoints (dont `responses`) reste refusé explicitement.
+
 ---
 
 ## Flux de requête
@@ -102,7 +113,7 @@ graph TD
     B -->|list| F{Item liste}
 
     D --> G{Max chars<br/>atteint}
-    G -->|oui| C
+    G -->|oui| R[HTTP 413]
     G -->|non| H[Tokenisation]
 
     H --> I[NLP Inference<br/>token-classification]
@@ -204,6 +215,7 @@ sequenceDiagram
     Note right of TM: chaque appel sanitize_text
 
     ID->>ID: idle_for = now - _last_used_at
+    Note over ID,S: Surveillance en arrière-plan, seulement sans opération active ou en attente
 
     alt idle_for > timeout 300s
         ID->>GC: classifier = None<br/>tokenizer = None<br/>gc.collect<br/>torch.cuda.empty_cache
