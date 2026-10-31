@@ -91,6 +91,7 @@ async def test_proxy_filters_openai_payload(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_proxy_forwards_streaming_without_buffering(monkeypatch):
+    monkeypatch.setattr(privacy_app.settings, "filter_output", False)
     privacy_app.settings.inbound_api_keys = ["test-token"]
     privacy_app.sanitizer = FakeSanitizer()
 
@@ -154,13 +155,14 @@ async def test_proxy_suffixes_model_list(monkeypatch):
 async def test_sanitizer_preserves_user_config_keys(monkeypatch):
     sanitizer = privacy_app.PrivacySanitizer()
 
-    async def fake_sanitize_text(text, ctx, stats):
+    def fake_sanitize_text(text, ctx, stats, entities=None):
         if "Alice Smith" in text:
             stats.add("private_person", 2)
             return text.replace("Alice Smith", "[PRIVATE_PERSON_1]")
         return text
 
-    monkeypatch.setattr(sanitizer, "sanitize_text", fake_sanitize_text)
+    monkeypatch.setattr(sanitizer, "_sanitize_text_sync", fake_sanitize_text)
+    monkeypatch.setattr(sanitizer, "_infer", lambda texts: {text: [] for text in texts})
 
     sanitized, stats = await sanitizer.sanitize_payload(
         {
@@ -175,6 +177,7 @@ async def test_sanitizer_preserves_user_config_keys(monkeypatch):
     assert sanitized["reasoning_effort"] == "high"
     assert sanitized["messages"][0]["content"] == "Bonjour [PRIVATE_PERSON_1]"
     assert stats.spans == 1
+    await sanitizer.aclose()
 
 
 def test_model_suffix_helpers_do_not_create_empty_model_ids():
